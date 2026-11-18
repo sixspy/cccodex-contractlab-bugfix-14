@@ -52,9 +52,9 @@ createApp({
     const token=ref(localStorage.getItem('contractlab_token')||'');
     const user=ref(localStorage.getItem('contractlab_user')||'');
     const username=ref('admin'), password=ref('123456'), err=ref(''), tab=ref(0), actionErr=ref('');
-    const contracts=ref([]), batches=ref([]), buffers=ref([]), recon=ref({});
+    const contracts=ref([]), batches=ref([]), buffers=ref([]), recon=ref({}), ledger=ref({});
     const form=ref({subject:'订单入站', payload_fields:'order_id,amount'});
-    const nav=['契约版本','入站校验','双写缓冲','契约对账'];
+    const nav=['契约版本','入站校验','双写缓冲','对账账册','契约对账'];
     function auth(){return {Authorization:'Bearer '+token.value,'Content-Type':'application/json'};}
     async function login(){
       err.value='';
@@ -81,6 +81,8 @@ createApp({
       buffers.value=Array.isArray(u.items)?u.items:[];
       const q=await loadJson('/api/reconcile'); if(q===null) return;
       recon.value=q&&typeof q==='object'?q:{};
+      const g=await loadJson('/api/reconcile/ledger'); if(g===null) return;
+      ledger.value=g&&typeof g==='object'?g:{};
     }
     async function validate(){
       actionErr.value='';
@@ -88,8 +90,15 @@ createApp({
       const j=await r.json(); actionErr.value=r.ok?('校验结果：'+j.result+(j.missing?('；缺 '+j.missing.join(',')):'')):(j.detail||'失败');
       await refresh();
     }
+    async function seal(){
+      actionErr.value='';
+      const r=await fetch('/api/reconcile/seal',{method:'POST',headers:auth(),body:JSON.stringify({})});
+      const j=await r.json().catch(()=>({}));
+      actionErr.value=r.ok?('标齐结果：'+j.status+(j.note?('；'+j.note):'')):(j.detail||j.status||'失败');
+      await refresh();
+    }
     onMounted(()=>{if(token.value)refresh();});
-    return {token,user,username,password,err,tab,nav,contracts,batches,buffers,recon,form,actionErr,login,logout,validate};
+    return {token,user,username,password,err,tab,nav,contracts,batches,buffers,recon,ledger,form,actionErr,login,logout,validate,seal};
   },
   template:`
   <div v-if="!token" class="login">
@@ -138,8 +147,39 @@ createApp({
       <tbody><tr v-for="b in buffers" :key="b.id"><td>{{b.id}}</td><td>{{b.batch_id}}</td><td>{{b.subject}}</td><td>{{b.reason}}</td></tr></tbody></table>
     </div>
     <div class="card" v-show="tab===3">
+      <h2>对账账册</h2>
+      <p class="meta">批次与缓冲明细逐笔对照；错挂或孤立的缓冲行单列在下方，不会计入对齐结论。
+        账册结论：<strong>{{(ledger.alignment||{}).status}}</strong>（来源 {{(ledger.alignment||{}).aligned_source}}）</p>
+      <table><thead><tr><th>批次</th><th>主题</th><th>结果</th><th>说明</th><th>缓冲行</th></tr></thead>
+      <tbody><tr v-for="b in (ledger.batches||[])" :key="b.id">
+        <td>#{{b.id}}</td><td>{{b.subject}}</td>
+        <td><span class="stamp" :class="{bad:b.result!=='通过'}">{{b.result}}</span></td>
+        <td>{{b.detail}}</td><td>{{b.buffer_rows}}</td>
+      </tr></tbody></table>
+      <h2 style="margin-top:16px">缓冲明细异常</h2>
+      <table><thead><tr><th>缓冲</th><th>批次</th><th>原因</th></tr></thead>
+      <tbody><tr v-for="b in (ledger.orphan_buffers||[])" :key="b.id"><td>{{b.id}}</td><td>{{b.batch_id}}</td><td>{{b.reason}}</td></tr>
+      <tr v-if="!(ledger.orphan_buffers||[]).length"><td colspan="3" class="meta">无</td></tr></tbody></table>
+    </div>
+    <div class="card" v-show="tab===4">
       <h2>契约对账摘要</h2>
-      <p>入站 {{recon.ingress_total}} · 通过 {{recon.passed}} · 缓冲 {{recon.buffered}} · 拒收 {{recon.rejected}} · 缓冲行 {{recon.buffer_rows}} · 对齐 {{recon.aligned}}</p>
+      <p>入站 {{recon.ingress_total}} · 通过 {{recon.passed}} · 缓冲 {{recon.buffered}} · 拒收 {{recon.rejected}} · 缓冲行 {{recon.buffer_rows}}</p>
+      <p>缓冲计数相符 {{recon.buffer_rows_match}} · 缓冲明细相符 {{recon.detail_match}} · 判定来源 {{recon.aligned_source}}</p>
+      <p><span class="stamp" :class="{bad:!recon.aligned}">{{recon.status}}</span></p>
+      <div class="card" style="margin-top:12px">
+        <h2>复核卡片 · 同源快照</h2>
+        <p class="meta" v-if="recon.snapshot">快照 #{{recon.snapshot.id}} · {{recon.snapshot.created_at}} · 路径 {{recon.snapshot.fix_path}} · {{recon.snapshot.note}}</p>
+        <p class="meta" v-else>尚无已对齐快照；页面不得本地聚合冒充对齐。</p>
+        <p v-if="recon.snapshot">快照计数：通过 {{recon.snapshot.passed}} · 缓冲 {{recon.snapshot.buffered}} · 拒收 {{recon.snapshot.rejected}} · 缓冲行 {{recon.snapshot.buffer_rows}}</p>
+      </div>
+      <div class="card" style="margin-top:12px">
+        <h2>假绿修复说明</h2>
+        <p class="meta" v-if="recon.fix_note">当天锁定路径 {{recon.fix_note.path}} · {{recon.fix_note.created_at}}</p>
+        <p style="white-space:pre-wrap">{{(recon.fix_note||{}).note}}</p>
+      </div>
+      <button class="primary" @click="seal">重算并标齐</button>
+      <div class="err">{{actionErr}}</div>
+      <p class="meta">标齐后结论只来自快照；入站、缓冲或账册有变动则快照自动失效。</p>
     </div>
   </div>`
 }).mount('#app');
